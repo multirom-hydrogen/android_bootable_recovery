@@ -442,7 +442,8 @@ ifeq ($(TARGET_RECOVERY_IS_MULTIROM), true)
         ntfs-3g \
         cp_xattrs \
         ls_xattrs \
-        mount_shim.sh
+        mount_shim.sh \
+        umount_shim.sh
 endif
 
 ifneq ($(TARGET_ARCH), arm64)
@@ -571,11 +572,15 @@ ifeq ($(shell test $(PLATFORM_SDK_VERSION) -gt 22; echo $$?),0)
 endif
 
 #MultiROM uses restorecon -D which is only available in toolbox
-ifeq ($(TARGET_RECOVERY_IS_MULTIROM), true)
-	ifeq ($(TWHAVE_SELINUX), true)
-		exclude += restorecon
-	endif
-endif
+# Update: This no longer works since restorecon has been moved to toybox,
+#         furthermore the existence of file_contexts and file_contexts.bin
+#         has made recovery based restorecon unreliable for secondary ROMs
+#         so instead opt for using the secondary ROM's own restorecon
+#ifeq ($(TARGET_RECOVERY_IS_MULTIROM), true)
+#	ifeq ($(TWHAVE_SELINUX), true)
+#		exclude += restorecon
+#	endif
+#endif
 
 # If busybox does not have restorecon, assume it does not have SELinux support.
 # Then, let toolbox provide 'ls' so -Z is available to list SELinux contexts.
