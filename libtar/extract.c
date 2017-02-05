@@ -20,6 +20,10 @@
 #include <errno.h>
 #include <utime.h>
 
+#include <sys/capability.h>
+#include <sys/xattr.h>
+#include <linux/xattr.h>
+
 #ifdef STDC_HEADERS
 # include <stdlib.h>
 #endif
@@ -28,8 +32,10 @@
 # include <unistd.h>
 #endif
 
-#ifdef HAVE_SELINUX
-# include "selinux/selinux.h"
+#include <selinux/selinux.h>
+
+#ifdef HAVE_EXT4_CRYPT
+# include "ext4crypt_tar.h"
 #endif
 
 const unsigned long long progress_size = (unsigned long long)(T_BLOCKSIZE);
@@ -151,7 +157,6 @@ tar_extract_file(TAR *t, const char *realname, const char *prefix, const int *pr
 		return i;
 	}
 
-#ifdef HAVE_SELINUX
 	if((t->options & TAR_STORE_SELINUX) && t->th_buf.selinux_context != NULL)
 	{
 #ifdef DEBUG
@@ -160,7 +165,16 @@ tar_extract_file(TAR *t, const char *realname, const char *prefix, const int *pr
 		if (lsetfilecon(realname, t->th_buf.selinux_context) < 0)
 			fprintf(stderr, "tar_extract_file(): failed to restore SELinux context %s to file %s !!!\n", t->th_buf.selinux_context, realname);
 	}
+
+	if((t->options & TAR_STORE_POSIX_CAP) && t->th_buf.has_cap_data)
+	{
+#if 1 //def DEBUG
+		printf("tar_extract_file(): restoring posix capabilities to file %s\n", realname);
+		print_caps(&t->th_buf.cap_data);
 #endif
+		if (setxattr(realname, XATTR_NAME_CAPS, &t->th_buf.cap_data, sizeof(struct vfs_cap_data), 0) < 0)
+			fprintf(stderr, "tar_extract_file(): failed to restore posix capabilities to file %s !!!\n", realname);
+	}
 
 #ifdef LIBTAR_FILE_HASH
 	pn = th_get_pathname(t);
@@ -492,7 +506,7 @@ tar_extract_dir(TAR *t, const char *realname)
 			}
 			else
 			{
-#ifdef DEBUG
+#if 1 //def DEBUG
 				puts("  *** using existing directory");
 #endif
 				return 1;
@@ -506,6 +520,28 @@ tar_extract_dir(TAR *t, const char *realname)
 			return -1;
 		}
 	}
+
+#ifdef HAVE_EXT4_CRYPT
+	if(t->th_buf.e4crypt_policy != NULL)
+	{
+#ifdef DEBUG
+		printf("tar_extract_file(): restoring EXT4 crypt policy %s to dir %s\n", t->th_buf.e4crypt_policy, realname);
+#endif
+		char binary_policy[EXT4_KEY_DESCRIPTOR_SIZE];
+		if (!lookup_ref_tar(t->th_buf.e4crypt_policy, &binary_policy)) {
+			printf("error looking up proper e4crypt policy for '%s' - %s\n", realname, t->th_buf.e4crypt_policy);
+			return -1;
+		}
+		char policy_hex[EXT4_KEY_DESCRIPTOR_HEX];
+		policy_to_hex(binary_policy, policy_hex);
+		printf("restoring policy %s > '%s' to '%s'\n", t->th_buf.e4crypt_policy, policy_hex, realname);
+		if (!e4crypt_policy_set(realname, binary_policy, EXT4_KEY_DESCRIPTOR_SIZE, 0))
+		{
+			printf("tar_extract_file(): failed to restore EXT4 crypt policy %s to dir '%s' '%s'!!!\n", t->th_buf.e4crypt_policy, realname, policy_hex);
+			//return -1; // This may not be an error in some cases, so log and ignore
+		}
+	}
+#endif
 
 	return 0;
 }

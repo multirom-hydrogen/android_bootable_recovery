@@ -42,6 +42,12 @@ using namespace rapidxml;
 #ifndef TW_Y_OFFSET
 #define TW_Y_OFFSET 0
 #endif
+#ifndef TW_W_OFFSET
+#define TW_W_OFFSET 0
+#endif
+#ifndef TW_H_OFFSET
+#define TW_H_OFFSET 0
+#endif
 
 class RenderObject
 {
@@ -340,6 +346,7 @@ protected:
 	int multirom_create_internal_rom_name(std::string arg);
 	int multirom_list_roms_for_swap(std::string arg);
 #endif //TARGET_RECOVERY_IS_MULTIROM
+	int checkforapp(std::string arg);
 
 	// (originally) threaded actions
 	int fileexists(std::string arg);
@@ -397,7 +404,10 @@ protected:
 	int system_image_upgrader(std::string arg);
 #endif //TARGET_RECOVERY_IS_MULTIROM
 	int setlanguage(std::string arg);
+	int togglebacklight(std::string arg);
 	int twcmd(std::string arg);
+	int setbootslot(std::string arg);
+	int installapp(std::string arg);
 
 	int simulate;
 };
@@ -1274,8 +1284,6 @@ COLOR LoadAttrColor(xml_node<>* element, const char* attrname, COLOR defaultvalu
 FontResource* LoadAttrFont(xml_node<>* element, const char* attrname);
 ImageResource* LoadAttrImage(xml_node<>* element, const char* attrname);
 AnimationResource* LoadAttrAnimation(xml_node<>* element, const char* attrname);
-
 bool LoadPlacement(xml_node<>* node, int* x, int* y, int* w = NULL, int* h = NULL, Placement* placement = NULL);
 
 #endif  // _OBJECTS_HEADER
-

@@ -40,7 +40,7 @@
 #include "twrp-functions.hpp"
 #include "fixContexts.hpp"
 #include "twrpDigest.hpp"
-#include "twrpDU.hpp"
+#include "exclude.hpp"
 #include "set_metadata.h"
 #include "tw_atomic.hpp"
 #include "gui/gui.hpp"
@@ -62,6 +62,14 @@ extern "C" {
 	#include "crypto/lollipop/cryptfs.h"
 	#include "gui/rapidxml.hpp"
 	#include "gui/pages.hpp"
+	#ifdef TW_INCLUDE_FBE
+		#include "crypto/ext4crypt/Decrypt.h"
+	#endif
+#endif
+
+#ifdef AB_OTA_UPDATER
+#include <hardware/hardware.h>
+#include <hardware/boot_control.h>
 #endif
 
 extern bool datamedia;
@@ -70,6 +78,15 @@ TWPartitionManager::TWPartitionManager(void) {
 	mtp_was_enabled = false;
 	mtp_write_fd = -1;
 	stop_backup.set_value(0);
+#ifdef AB_OTA_UPDATER
+	char slot_suffix[PROPERTY_VALUE_MAX];
+	property_get("ro.boot.slot_suffix", slot_suffix, "_a");
+	Active_Slot_Display = "";
+	if (strcmp(slot_suffix, "_a") == 0)
+		Set_Active_Slot("A");
+	else
+		Set_Active_Slot("B");
+#endif
 }
 
 int TWPartitionManager::Process_Fstab(string Fstab_Filename, bool Display_Error) {
@@ -163,17 +180,28 @@ int TWPartitionManager::Process_Fstab(string Fstab_Filename, bool Display_Error)
 #ifdef TW_INCLUDE_CRYPTO
 	TWPartition* Decrypt_Data = Find_Partition_By_Path("/data");
 	if (Decrypt_Data && Decrypt_Data->Is_Encrypted && !Decrypt_Data->Is_Decrypted) {
-		int password_type = cryptfs_get_password_type();
-		if (password_type == CRYPT_TYPE_DEFAULT) {
-			LOGINFO("Device is encrypted with the default password, attempting to decrypt.\n");
-			if (Decrypt_Device("default_password") == 0) {
-				gui_msg("decrypt_success=Successfully decrypted with default password.");
-				DataManager::SetValue(TW_IS_ENCRYPTED, 0);
-			} else {
-				gui_err("unable_to_decrypt=Unable to decrypt with default password.");
+		if (Decrypt_Data->Is_FBE) {
+			if (DataManager::GetIntValue(TW_CRYPTO_PWTYPE) == 0) {
+				if (Decrypt_Device("!") == 0) {
+					gui_msg("decrypt_success=Successfully decrypted with default password.");
+					DataManager::SetValue(TW_IS_ENCRYPTED, 0);
+				} else {
+					gui_err("unable_to_decrypt=Unable to decrypt with default password.");
+				}
 			}
 		} else {
-			DataManager::SetValue("TW_CRYPTO_TYPE", password_type);
+			int password_type = cryptfs_get_password_type();
+			if (password_type == CRYPT_TYPE_DEFAULT) {
+				LOGINFO("Device is encrypted with the default password, attempting to decrypt.\n");
+				if (Decrypt_Device("default_password") == 0) {
+					gui_msg("decrypt_success=Successfully decrypted with default password.");
+					DataManager::SetValue(TW_IS_ENCRYPTED, 0);
+				} else {
+					gui_err("unable_to_decrypt=Unable to decrypt with default password.");
+				}
+			} else {
+				DataManager::SetValue("TW_CRYPTO_TYPE", password_type);
+			}
 		}
 	}
 	if (Decrypt_Data && (!Decrypt_Data->Is_Encrypted || Decrypt_Data->Is_Decrypted) && Decrypt_Data->Mount(false)) {
@@ -182,6 +210,9 @@ int TWPartitionManager::Process_Fstab(string Fstab_Filename, bool Display_Error)
 #endif
 	Update_System_Details();
 	UnMount_Main_Partitions();
+#ifdef AB_OTA_UPDATER
+	DataManager::SetValue("tw_active_slot", Get_Active_Slot_Display());
+#endif
 	return true;
 }
 
@@ -299,6 +330,8 @@ void TWPartitionManager::Output_Partition(TWPartition* Part) {
 		printf("Can_Flash_Img ");
 	if (Part->Is_Adopted_Storage)
 		printf("Is_Adopted_Storage ");
+	if (Part->SlotSelect)
+		printf("SlotSelect ");
 	printf("\n");
 	if (!Part->SubPartition_Of.empty())
 		printf("   SubPartition_Of: %s\n", Part->SubPartition_Of.c_str());
@@ -342,8 +375,7 @@ void TWPartitionManager::Output_Partition(TWPartition* Part) {
 	if (!Part->Bind_Of.empty())
 		printf("   Bind_Of: %s\n", Part->Bind_Of.c_str());
 #endif //TARGET_RECOVERY_IS_MULTIROM
-	string back_meth = Part->Backup_Method_By_Name();
-	printf("   Backup_Method: %s\n", back_meth.c_str());
+	printf("   Backup_Method: %s\n", Part->Backup_Method_By_Name().c_str());
 	if (Part->Mount_Flags || !Part->Mount_Options.empty())
 		printf("   Mount_Options: %s\n", Part->Mount_Options.c_str());
 	if (Part->MTP_Storage_ID)
@@ -549,10 +581,9 @@ bool TWPartitionManager::Make_MD5(PartitionSettings *part_settings)
 	return true;
 }
 
-
 bool TWPartitionManager::Backup_Partition(PartitionSettings *part_settings) {
 	time_t start, stop;
-	int use_compression, adb_control_bu_fd;
+	int use_compression;
 	string backup_log = part_settings->Backup_Folder + "/recovery.log";
 
 	if (part_settings->Part == NULL)
@@ -565,13 +596,11 @@ bool TWPartitionManager::Backup_Partition(PartitionSettings *part_settings) {
 
 	if (part_settings->Part->Backup(part_settings, &tar_fork_pid)) {
 		bool md5Success = false;
-		if (part_settings->adbbackup) {
+		if (part_settings->adbbackup)
 			md5Success = true;
-		}
 		else
 			md5Success = Make_MD5(part_settings);
 
-		TWFunc::SetPerformanceMode(false);
 		if (part_settings->Part->Has_SubPartition) {
 			std::vector<TWPartition*>::iterator subpart;
 			TWPartition *parentPart = part_settings->Part;
@@ -580,10 +609,10 @@ bool TWPartitionManager::Backup_Partition(PartitionSettings *part_settings) {
 				if ((*subpart)->Can_Be_Backed_Up && (*subpart)->Is_SubPartition && (*subpart)->SubPartition_Of == parentPart->Mount_Point) {
 					part_settings->Part = *subpart;
 					if (!(*subpart)->Backup(part_settings, &tar_fork_pid)) {
-						TWFunc::SetPerformanceMode(false);
 						Clean_Backup_Folder(part_settings->Backup_Folder);
 						TWFunc::copy_file("/tmp/recovery.log", backup_log, 0644);
 						tw_set_default_metadata(backup_log.c_str());
+						TWFunc::SetPerformanceMode(false);
 						return false;
 					}
 					sync();
@@ -608,6 +637,7 @@ bool TWPartitionManager::Backup_Partition(PartitionSettings *part_settings) {
 
 		}
 
+		TWFunc::SetPerformanceMode(false);
 		return md5Success;
 	} else {
 		Clean_Backup_Folder(part_settings->Backup_Folder);
@@ -677,14 +707,14 @@ int TWPartitionManager::Cancel_Backup() {
 
 int TWPartitionManager::Run_Backup(bool adbbackup) {
 	PartitionSettings part_settings;
-	int check, partition_count = 0, disable_free_space_check = 0, do_md5 = 0;
+	int partition_count = 0, disable_free_space_check = 0, do_md5 = 0;
 	int gui_adb_backup;
 	string Backup_Name, Backup_List, backup_path;
-	unsigned long long total_bytes = 0, free_space = 0, subpart_size;
+	unsigned long long total_bytes = 0, free_space = 0;
 	TWPartition* storage = NULL;
 	std::vector<TWPartition*>::iterator subpart;
 	struct tm *t;
-	time_t start, stop, seconds, total_start, total_stop;
+	time_t seconds, total_start, total_stop;
 	size_t start_pos = 0, end_pos = 0;
 	stop_backup.set_value(0);
 	seconds = time(0);
@@ -709,7 +739,6 @@ int TWPartitionManager::Run_Backup(bool adbbackup) {
 
 	if (!Mount_Current_Storage(true))
 		return false;
-
 
 	DataManager::GetValue(TW_SKIP_MD5_GENERATE_VAR, do_md5);
 	if (do_md5 == 0)
@@ -822,7 +851,6 @@ int TWPartitionManager::Run_Backup(bool adbbackup) {
 		part_settings.Part = Find_Partition_By_Path(backup_path);
 		if (part_settings.Part != NULL) {
 			if (!Backup_Partition(&part_settings))
-
 				return false;
 		} else {
 			gui_msg(Msg(msg::kError, "unable_to_locate_partition=Unable to locate '{1}' partition for backup calculations.")(backup_path));
@@ -848,14 +876,16 @@ int TWPartitionManager::Run_Backup(bool adbbackup) {
 	int total_time = (int) difftime(total_stop, total_start);
 
 	uint64_t actual_backup_size;
-	if (!adbbackup)
-		actual_backup_size = du.Get_Folder_Size(part_settings.Backup_Folder);
-	else
+	if (!adbbackup) {
+		TWExclude twe;
+		actual_backup_size = twe.Get_Folder_Size(part_settings.Backup_Folder);
+	} else
 		actual_backup_size = part_settings.file_bytes + part_settings.img_bytes;
 	actual_backup_size /= (1024LLU * 1024LLU);
 
 	int prev_img_bps = 0, use_compression = 0;
 	unsigned long long prev_file_bps = 0;
+	DataManager::GetValue(TW_BACKUP_AVG_IMG_RATE, prev_img_bps);
 	img_bps += (prev_img_bps * 4);
 	img_bps /= 5;
 
@@ -899,7 +929,6 @@ bool TWPartitionManager::Restore_Partition(PartitionSettings *part_settings) {
 
 	time(&Start);
 
-
 	if (!part_settings->Part->Restore(part_settings)) {
 		TWFunc::SetPerformanceMode(false);
 		return false;
@@ -928,8 +957,7 @@ bool TWPartitionManager::Restore_Partition(PartitionSettings *part_settings) {
 
 int TWPartitionManager::Run_Restore(const string& Restore_Name) {
 	PartitionSettings part_settings;
-	int check_md5, check, partition_count = 0;
-	TWPartition* restore_part = NULL;
+	int check_md5;
 
 	time_t rStart, rStop;
 	time(&rStart);
@@ -1216,26 +1244,26 @@ int TWPartitionManager::Wipe_Dalvik_Cache(void) {
 	if (!Mount_By_Path("/data", true))
 		return false;
 
-	if (!Mount_By_Path("/cache", true))
-		return false;
-
 	dir.push_back("/data/dalvik-cache");
-	dir.push_back("/cache/dalvik-cache");
-	dir.push_back("/cache/dc");
-	gui_msg("wiping_dalvik=Wiping Dalvik Cache Directories...");
-	for (unsigned i = 0; i < dir.size(); ++i) {
-		if (stat(dir.at(i).c_str(), &st) == 0) {
-			TWFunc::removeDir(dir.at(i), false);
-			gui_msg(Msg("cleaned=Cleaned: {1}...")(dir.at(i)));
-		}
+	if (Mount_By_Path("/cache", false)) {
+		dir.push_back("/cache/dalvik-cache");
+		dir.push_back("/cache/dc");
 	}
+
 	TWPartition* sdext = Find_Partition_By_Path("/sd-ext");
 	if (sdext && sdext->Is_Present && sdext->Mount(false))
 	{
 		if (stat("/sd-ext/dalvik-cache", &st) == 0)
 		{
-			TWFunc::removeDir("/sd-ext/dalvik-cache", false);
-			gui_msg(Msg("cleaned=Cleaned: {1}...")("/sd-ext/dalvik-cache"));
+			dir.push_back("/sd-ext/dalvik-cache");
+		}
+	}
+
+	gui_msg("wiping_dalvik=Wiping Dalvik Cache Directories...");
+	for (unsigned i = 0; i < dir.size(); ++i) {
+		if (stat(dir.at(i).c_str(), &st) == 0) {
+			TWFunc::removeDir(dir.at(i), false);
+			gui_msg(Msg("cleaned=Cleaned: {1}...")(dir.at(i)));
 		}
 	}
 	gui_msg("dalvik_done=-- Dalvik Cache Directories Wipe Complete!");
@@ -1388,8 +1416,8 @@ void TWPartitionManager::Update_System_Details(void) {
 
 	gui_msg("update_part_details=Updating partition details...");
 	for (iter = Partitions.begin(); iter != Partitions.end(); iter++) {
+		(*iter)->Update_Size(true);
 		if ((*iter)->Can_Be_Mounted) {
-			(*iter)->Update_Size(true);
 			if ((*iter)->Mount_Point == "/system") {
 				int backup_display_size = (int)((*iter)->Backup_Size / 1048576LLU);
 				DataManager::SetValue(TW_BACKUP_SYSTEM_SIZE, backup_display_size);
@@ -1527,11 +1555,39 @@ void TWPartitionManager::Update_Storage_Sizes()
 }
 #endif //TARGET_RECOVERY_IS_MULTIROM
 
+void TWPartitionManager::Post_Decrypt(const string& Block_Device) {
+	TWPartition* dat = Find_Partition_By_Path("/data");
+	if (dat != NULL) {
+		DataManager::SetValue(TW_IS_DECRYPTED, 1);
+		dat->Is_Decrypted = true;
+		if (!Block_Device.empty()) {
+			dat->Decrypted_Block_Device = Block_Device;
+			gui_msg(Msg("decrypt_success_dev=Data successfully decrypted, new block device: '{1}'")(Block_Device));
+		} else {
+			gui_msg("decrypt_success_nodev=Data successfully decrypted");
+		}
+		dat->Setup_File_System(false);
+		dat->Current_File_System = dat->Fstab_File_System; // Needed if we're ignoring blkid because encrypted devices start out as emmc
+
+		// Sleep for a bit so that the device will be ready
+		sleep(1);
+		if (dat->Has_Data_Media && dat->Mount(false) && TWFunc::Path_Exists("/data/media/0")) {
+			dat->Storage_Path = "/data/media/0";
+			dat->Symlink_Path = dat->Storage_Path;
+			DataManager::SetValue("tw_storage_path", "/data/media/0");
+			DataManager::SetValue("tw_settings_path", "/data/media/0");
+			dat->UnMount(false);
+			Output_Partition(dat);
+		}
+		Update_System_Details();
+		UnMount_Main_Partitions();
+	} else
+		LOGERR("Unable to locate data partition.\n");
+}
+
 int TWPartitionManager::Decrypt_Device(string Password) {
 #ifdef TW_INCLUDE_CRYPTO
-	int ret_val, password_len;
 	char crypto_state[PROPERTY_VALUE_MAX], crypto_blkdev[PROPERTY_VALUE_MAX], cPassword[255];
-	size_t result;
 	std::vector<TWPartition*>::iterator iter;
 
 	// Mount any partitions that need to be mounted for decrypt
@@ -1546,6 +1602,25 @@ int TWPartitionManager::Decrypt_Device(string Password) {
 		property_set("ro.crypto.state", "encrypted");
 		// Sleep for a bit so that services can start if needed
 		sleep(1);
+	}
+
+	if (DataManager::GetIntValue(TW_IS_FBE)) {
+#ifdef TW_INCLUDE_FBE
+		if (!Mount_By_Path("/data", true)) // /data has to be mounted for FBE
+			return -1;
+		int retry_count = 10;
+		while (!TWFunc::Path_Exists("/data/system/users/gatekeeper.password.key") && --retry_count)
+			usleep(2000); // A small sleep is needed after mounting /data to ensure reliable decrypt... maybe because of DE?
+		int user_id = DataManager::GetIntValue("tw_decrypt_user_id");
+		LOGINFO("Decrypting FBE for user %i\n", user_id);
+		if (Decrypt_User(user_id, Password)) {
+			Post_Decrypt("");
+			return 0;
+		}
+#else
+		LOGERR("FBE support is not present\n");
+#endif
+		return -1;
 	}
 
 	strcpy(cPassword, Password.c_str());
@@ -1567,29 +1642,7 @@ int TWPartitionManager::Decrypt_Device(string Password) {
 	if (strcmp(crypto_blkdev, "error") == 0) {
 		LOGERR("Error retrieving decrypted data block device.\n");
 	} else {
-		TWPartition* dat = Find_Partition_By_Path("/data");
-		if (dat != NULL) {
-			DataManager::SetValue(TW_IS_DECRYPTED, 1);
-			dat->Is_Decrypted = true;
-			dat->Decrypted_Block_Device = crypto_blkdev;
-			dat->Setup_File_System(false);
-			dat->Current_File_System = dat->Fstab_File_System; // Needed if we're ignoring blkid because encrypted devices start out as emmc
-			gui_msg(Msg("decrypt_success_dev=Data successfully decrypted, new block device: '{1}'")(crypto_blkdev));
-
-			// Sleep for a bit so that the device will be ready
-			sleep(1);
-			if (dat->Has_Data_Media && dat->Mount(false) && TWFunc::Path_Exists("/data/media/0")) {
-				dat->Storage_Path = "/data/media/0";
-				dat->Symlink_Path = dat->Storage_Path;
-				DataManager::SetValue("tw_storage_path", "/data/media/0");
-				DataManager::SetValue("tw_settings_path", "/data/media/0");
-				dat->UnMount(false);
-				Output_Partition(dat);
-			}
-			Update_System_Details();
-			UnMount_Main_Partitions();
-		} else
-			LOGERR("Unable to locate data partition.\n");
+		Post_Decrypt(crypto_blkdev);
 	}
 	return 0;
 #else
@@ -1600,7 +1653,6 @@ int TWPartitionManager::Decrypt_Device(string Password) {
 }
 
 int TWPartitionManager::Fix_Contexts(void) {
-#ifdef HAVE_SELINUX
 	std::vector<TWPartition*>::iterator iter;
 	for (iter = Partitions.begin(); iter != Partitions.end(); iter++) {
 		if ((*iter)->Has_Data_Media) {
@@ -1613,10 +1665,6 @@ int TWPartitionManager::Fix_Contexts(void) {
 	UnMount_Main_Partitions();
 	gui_msg("done=Done.");
 	return 0;
-#else
-	LOGERR("Cannot fix contexts, no selinux support present.\n");
-	return -1;
-#endif
 }
 
 TWPartition* TWPartitionManager::Find_Next_Storage(string Path, bool Exclude_Data_Media) {
@@ -1663,7 +1711,7 @@ int TWPartitionManager::Open_Lun_File(string Partition_Path, string Lun_File) {
 }
 
 int TWPartitionManager::usb_storage_enable(void) {
-	int has_dual, has_data_media;
+	int has_data_media;
 	char lun_file[255];
 	bool has_multiple_lun = false;
 
@@ -1776,7 +1824,7 @@ void TWPartitionManager::UnMount_Main_Partitions(void) {
 }
 
 int TWPartitionManager::Partition_SDCard(void) {
-	char mkdir_path[255], temp[255], line[512];
+	char temp[255];
 	string Storage_Path, Command, Device, fat_str, ext_str, start_loc, end_loc, ext_format, sd_path, tmpdevice;
 	int ext, swap, total_size = 0, fat_size;
 
@@ -2161,13 +2209,13 @@ TWPartition *TWPartitionManager::Get_Default_Storage_Partition()
 {
 	TWPartition *res = NULL;
 	for (std::vector<TWPartition*>::iterator iter = Partitions.begin(); iter != Partitions.end(); ++iter) {
-		if(!(*iter)->Is_Storage)
+		if (!(*iter)->Is_Storage)
 			continue;
 
-		if((*iter)->Is_Settings_Storage)
+		if ((*iter)->Is_Settings_Storage)
 			return *iter;
 
-		if(!res)
+		if (!res)
 			res = *iter;
 	}
 	return res;
@@ -2393,7 +2441,7 @@ bool TWPartitionManager::Remove_MTP_Storage(unsigned int Storage_ID) {
 }
 
 bool TWPartitionManager::Flash_Image(string& path, string& filename) {
-	int check, partition_count = 0;
+	int partition_count = 0;
 	TWPartition* flash_part = NULL;
 	string Flash_List, flash_path, full_filename;
 	size_t start_pos = 0, end_pos = 0;
@@ -2656,7 +2704,6 @@ void TWPartitionManager::Decrypt_Adopted() {
 	char* xmlFile = PageManager::LoadFileToBuffer("/data/system/storage.xml", NULL);
 	xml_document<> *doc = NULL;
 	xml_node<>* volumes = NULL;
-	xml_node<>* volume = NULL;
 	string Primary_Storage_UUID = "";
 	if (xmlFile != NULL) {
 		LOGINFO("successfully loaded storage.xml\n");
@@ -2740,4 +2787,47 @@ void TWPartitionManager::Remove_Partition_By_Path(string Path) {
 			return;
 		}
 	}
+}
+
+void TWPartitionManager::Set_Active_Slot(const string& Slot) {
+	if (Slot != "A" && Slot != "B") {
+		LOGERR("Set_Active_Slot invalid slot '%s'\n", Slot.c_str());
+		return;
+	}
+	if (Active_Slot_Display == Slot)
+		return;
+	LOGINFO("Setting active slot %s\n", Slot.c_str());
+#ifdef AB_OTA_UPDATER
+	if (!Active_Slot_Display.empty()) {
+		const hw_module_t *hw_module;
+		boot_control_module_t *module;
+		int ret;
+		ret = hw_get_module("bootctrl", &hw_module);
+		if (ret != 0) {
+			LOGERR("Error getting bootctrl module.\n");
+		} else {
+			module = (boot_control_module_t*) hw_module;
+			module->init(module);
+			int slot_number = 0;
+			if (Slot == "B")
+				slot_number = 1;
+			if (module->setActiveBootSlot(module, slot_number))
+				gui_msg(Msg(msg::kError, "unable_set_boot_slot=Error changing bootloader boot slot to {1}")(Slot));
+		}
+		DataManager::SetValue("tw_active_slot", Slot); // Doing this outside of this if block may result in a seg fault because the DataManager may not be ready yet
+	}
+#else
+	LOGERR("Boot slot feature not present\n");
+#endif
+	Active_Slot_Display = Slot;
+	if (Fstab_Processed())
+		Update_System_Details();
+}
+string TWPartitionManager::Get_Active_Slot_Suffix() {
+	if (Active_Slot_Display == "A")
+		return "_a";
+	return "_b";
+}
+string TWPartitionManager::Get_Active_Slot_Display() {
+	return Active_Slot_Display;
 }

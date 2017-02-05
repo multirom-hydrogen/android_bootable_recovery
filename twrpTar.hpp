@@ -27,7 +27,7 @@ extern "C" {
 #include <fstream>
 #include <string>
 #include <vector>
-#include "twrpDU.hpp"
+#include "exclude.hpp"
 #include "progresstracking.hpp"
 #include "partitions.hpp"
 #include "twrp-functions.hpp"
@@ -43,7 +43,6 @@ struct thread_data_struct {
 	std::vector<TarListStruct> *TarList;
 	unsigned thread_id;
 };
-
 
 class twrpTar {
 public:
@@ -69,6 +68,7 @@ public:
 	string partition_name;
 	string backup_folder;
 	PartitionSettings *part_settings;
+	TWExclude *backup_exclusions;
 
 private:
 	int extract();

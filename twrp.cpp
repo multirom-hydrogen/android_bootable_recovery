@@ -24,7 +24,7 @@
 #include "gui/twmsg.h"
 
 #include "cutils/properties.h"
-#include "bootloader.h"
+#include "bootloader_message/bootloader_message.h"
 
 #ifdef ANDROID_RB_RESTART
 #include "cutils/android_reboot.h"
@@ -45,7 +45,6 @@ extern "C" {
 #include "partitions.hpp"
 #include "openrecoveryscript.hpp"
 #include "variables.h"
-#include "twrpDU.hpp"
 #ifdef TW_USE_NEW_MINADBD
 #include "adb.h"
 #else
@@ -54,10 +53,8 @@ extern "C" {
 }
 #endif
 
-#ifdef HAVE_SELINUX
-#include "selinux/label.h"
+#include <selinux/label.h>
 struct selabel_handle *selinux_handle;
-#endif
 
 #ifdef TARGET_RECOVERY_IS_MULTIROM
 #include "multirom/multirom.h"
@@ -68,7 +65,6 @@ extern int adb_server_main(int is_daemon, int server_port, int /* reply_fd */);
 TWPartitionManager PartitionManager;
 int Log_Offset;
 bool datamedia;
-twrpDU du;
 
 static void Print_Prop(const char *key, const char *name, void *cookie) {
 	printf("%s=%s\n", key, name);
@@ -117,10 +113,10 @@ int main(int argc, char **argv) {
 	printf("Starting TWRP %s-%s on %s (pid %d)\n", TW_VERSION_STR, TW_GIT_REVISION, ctime(&StartupTime), getpid());
 
 #ifdef TARGET_RECOVERY_IS_MULTIROM
-#ifdef HAVE_SELINUX
 	printf("Setting SELinux to permissive\n");
 	TWFunc::write_file("/sys/fs/selinux/enforce", "0");
 
+	// TODO: file_contexts.bin
 	TWFunc::write_file("/file_contexts",
         "\n\n# MultiROM folders\n"
         "/data/media/multirom(/.*)?          <<none>>\n"
@@ -130,7 +126,6 @@ int main(int argc, char **argv) {
         "/sdcard/multirom(/.*)?              <<none>>\n"
         "/mnt/mrom(/.*)?                     <<none>>\n",
         "ae");
-#endif
 
 	// MultiROM _might_ have crashed the recovery while the boot device was redirected.
 	// It would be bad to let that as is.
@@ -172,7 +167,6 @@ int main(int argc, char **argv) {
 	// Load up all the resources
 	gui_loadResources();
 
-#ifdef HAVE_SELINUX
 	if (TWFunc::Path_Exists("/prebuilt_file_contexts")) {
 		if (TWFunc::Path_Exists("/file_contexts")) {
 			printf("Renaming regular /file_contexts -> /file_contexts.bak\n");
@@ -192,7 +186,7 @@ int main(int argc, char **argv) {
 	{ // Check to ensure SELinux can be supported by the kernel
 		char *contexts = NULL;
 
-		if (PartitionManager.Mount_By_Path("/cache", true) && TWFunc::Path_Exists("/cache/recovery")) {
+		if (PartitionManager.Mount_By_Path("/cache", false) && TWFunc::Path_Exists("/cache/recovery")) {
 			lgetfilecon("/cache/recovery", &contexts);
 			if (!contexts) {
 				lsetfilecon("/cache/recovery", "test");
@@ -209,24 +203,18 @@ int main(int argc, char **argv) {
 			gui_msg("full_selinux=Full SELinux support is present.");
 		}
 	}
-#else
-	gui_warn("no_selinux=No SELinux support (no libselinux).");
-#endif
 
-	PartitionManager.Mount_By_Path("/cache", true);
+	PartitionManager.Mount_By_Path("/cache", false);
 
-	string Reboot_Value;
 	bool Shutdown = false;
-
+	string Send_Intent = "";
 	{
 		TWPartition* misc = PartitionManager.Find_Partition_By_Path("/misc");
 		if (misc != NULL) {
 			if (misc->Current_File_System == "emmc") {
-				set_misc_device("emmc", misc->Actual_Block_Device.c_str());
-			} else if (misc->Current_File_System == "mtd") {
-				set_misc_device("mtd", misc->MTD_Name.c_str());
+				set_misc_device(misc->Actual_Block_Device);
 			} else {
-				LOGERR("Unknown file system for /misc\n");
+				LOGERR("Only emmc /misc is supported\n");
 			}
 		}
 		get_args(&argc, &argv);
@@ -265,6 +253,7 @@ int main(int argc, char **argv) {
 					if (!OpenRecoveryScript::Insert_ORS_Command("wipe cache\n"))
 						break;
 				}
+				// Other 'w' items are wipe_ab and wipe_package_size which are related to bricking the device remotely. We will not bother to suppor these as having TWRP probably makes "bricking" the device in this manner useless
 			} else if (*argptr == 'n') {
 				DataManager::SetValue(TW_BACKUP_NAME, gui_parse_text("{@auto_generate}"));
 				if (!OpenRecoveryScript::Insert_ORS_Command("backup BSDCAE\n"))
@@ -272,19 +261,28 @@ int main(int argc, char **argv) {
 			} else if (*argptr == 'p') {
 				Shutdown = true;
 			} else if (*argptr == 's') {
-				ptr = argptr;
-				index2 = 0;
-				while (*ptr != '=' && *ptr != '\n')
-					ptr++;
-				if (*ptr) {
-					Reboot_Value = *ptr;
+				if (strncmp(argptr, "send_intent", strlen("send_intent")) == 0) {
+					ptr = argptr + strlen("send_intent") + 1;
+					Send_Intent = *ptr;
+				} else if (strncmp(argptr, "security", strlen("security")) == 0) {
+					LOGINFO("Security update\n");
+				} else if (strncmp(argptr, "sideload", strlen("sideload")) == 0) {
+					if (!OpenRecoveryScript::Insert_ORS_Command("sideload\n"))
+						break;
+				} else if (strncmp(argptr, "stages", strlen("stages")) == 0) {
+					LOGINFO("ignoring stages command\n");
+				}
+			} else if (*argptr == 'r') {
+				if (strncmp(argptr, "reason", strlen("reason")) == 0) {
+					ptr = argptr + strlen("reason") + 1;
+					gui_print("%s\n", ptr);
 				}
 			}
 		}
 		printf("\n");
 	}
 
-	if(crash_counter == 0) {
+	if (crash_counter == 0) {
 		property_list(Print_Prop, NULL);
 		printf("\n");
 	} else {
@@ -351,7 +349,7 @@ int main(int argc, char **argv) {
 #endif //TARGET_RECOVERY_IS_MULTIROM
 
 	// Fixup the RTC clock on devices which require it
-	if(crash_counter == 0)
+	if (crash_counter == 0)
 		TWFunc::Fixup_Time_On_Boot();
 
 	// Run any outstanding OpenRecoveryScript
@@ -447,7 +445,7 @@ int main(int argc, char **argv) {
 #endif
 
 	// Reboot
-	TWFunc::Update_Intent_File(Reboot_Value);
+	TWFunc::Update_Intent_File(Send_Intent);
 	TWFunc::Update_Log_File();
 	gui_msg(Msg("rebooting=Rebooting..."));
 	string Reboot_Arg;
