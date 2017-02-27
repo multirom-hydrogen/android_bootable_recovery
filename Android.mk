@@ -565,11 +565,26 @@ ifeq ($(shell test $(CM_PLATFORM_SDK_VERSION) -ge 3; echo $$?),0)
 endif
 endif
 
+ifeq ($(shell test $(PLATFORM_SDK_VERSION) -ge 25; echo $$?),0)
+    LOCAL_ADDITIONAL_DEPENDENCIES += file_contexts_symlink
+endif
+
 ifeq ($(BOARD_CACHEIMAGE_PARTITION_SIZE),)
 LOCAL_REQUIRED_MODULES := recovery-persist recovery-refresh
 endif
 
 include $(BUILD_EXECUTABLE)
+
+# Symlink for file_contexts
+include $(CLEAR_VARS)
+
+LOCAL_MODULE := file_contexts_symlink
+LOCAL_MODULE_TAGS := optional
+LOCAL_POST_INSTALL_CMD := \
+    $(hide) mkdir -p $(TARGET_RECOVERY_ROOT_OUT)/sbin && \
+    ln -sf /file_contexts.bin $(TARGET_RECOVERY_ROOT_OUT)/file_contexts
+
+include $(BUILD_PHONY_PACKAGE)
 
 ifneq ($(TW_USE_TOOLBOX), true)
 include $(CLEAR_VARS)
@@ -698,10 +713,6 @@ ifeq ($(AB_OTA_UPDATER),true)
     LOCAL_CFLAGS += -DAB_OTA_UPDATER=1
 endif
 
-ifneq ($(BOARD_RECOVERY_BLDRMSG_OFFSET),)
-    LOCAL_CFLAGS += -DBOARD_RECOVERY_BLDRMSG_OFFSET=$(BOARD_RECOVERY_BLDRMSG_OFFSET)
-endif
-
 include $(BUILD_SHARED_LIBRARY)
 
 # All the APIs for testing
@@ -763,7 +774,8 @@ include $(commands_recovery_local_path)/injecttwrp/Android.mk \
     $(commands_recovery_local_path)/toybox/Android.mk \
     $(commands_recovery_local_path)/simg2img/Android.mk \
     $(commands_recovery_local_path)/adbbu/Android.mk \
-    $(commands_recovery_local_path)/libpixelflinger/Android.mk
+    $(commands_recovery_local_path)/libpixelflinger/Android.mk \
+    $(commands_recovery_local_path)/attr/Android.mk
 
 #MultiROM
 ifeq ($(TARGET_RECOVERY_IS_MULTIROM), true)
